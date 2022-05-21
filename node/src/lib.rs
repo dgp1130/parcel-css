@@ -13,7 +13,7 @@ use parcel_css::targets::Browsers;
 use parcel_sourcemap::SourceMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------
 
@@ -121,12 +121,87 @@ fn transform_style_attribute(ctx: CallContext) -> napi::Result<JsUnknown> {
   }
 }
 
+struct WrappedSourceProvider<P: SourceProvider> {
+  inner_source_provider: P,
+  js_resolver: Option<napi::JsFunction>,
+  js_read: Option<napi::threadsafe_function::ThreadsafeFunction<(String, Box<dyn Send + FnOnce(std::io::Result<String>) -> ()>)>>,
+}
+
+impl<P: SourceProvider> WrappedSourceProvider<P> {
+  fn new(
+    inner_source_provider: P,
+    js_resolver: Option<napi::JsFunction>,
+    js_read: Option<napi::threadsafe_function::ThreadsafeFunction<(String, Box<dyn Send + FnOnce(std::io::Result<String>)>)>>,
+  ) -> Self {
+    WrappedSourceProvider { inner_source_provider, js_resolver, js_read }
+  }
+}
+
+impl<P: SourceProvider> SourceProvider for WrappedSourceProvider<P> {
+  fn resolve(&self, specifier: &str, originating_file: &Path) -> Result<PathBuf, Error<BundleErrorKind>> {
+    self.inner_source_provider.resolve(specifier, originating_file)
+  }
+
+  fn read<'a>(&'a self, file: &Path) -> std::io::Result<&'a str> {
+    match &self.js_read {
+      Some(read) => {
+        match read.call(
+          Ok((String::from(file.to_str().unwrap()), Box::new(|result| {
+            match result {
+              Ok(contents) => eprintln!("Read file: {}", contents),
+              Err(err) => eprintln!("Failed to read file: {}", err),
+            }
+          }))),
+          napi::threadsafe_function::ThreadsafeFunctionCallMode::Blocking,
+        ) {
+          napi::Status::Ok => {
+            eprintln!("Succeeded with status: {}", napi::Status::Ok);
+            std::thread::sleep_ms(1_000);
+            self.inner_source_provider.read(file)
+          },
+          status => panic!("Failed with status: {}", status),
+        }
+      },
+      None => self.inner_source_provider.read(file),
+    }
+  }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[js_function(1)]
 fn bundle(ctx: CallContext) -> napi::Result<JsUnknown> {
   let opts = ctx.get::<JsObject>(0)?;
+
+  let (resolve_unsafe, read_unsafe) = match opts.get::<_, napi::JsObject>("resolver")? {
+    Some(resolver) => (
+      resolver.get::<_, napi::JsFunction>("resolve")?,
+      resolver.get::<_, napi::JsFunction>("read")?,
+    ),
+    None => (None, None),
+  };
+  let resolve = resolve_unsafe.map(|resolve_unsafe| {
+    ctx.env.create_threadsafe_function(
+      &resolve_unsafe,
+      0 /* max_queue_size */,
+      |ctx: napi::threadsafe_function::ThreadSafeCallContext<(String, String)>| {
+        Ok(vec![ ctx.env.create_string(ctx.value.0.as_ref()), ctx.env.create_string(ctx.value.1.as_ref()) ])
+      },
+    ).unwrap()
+  });
+  let read = read_unsafe.map(|read_unsafe| {
+    ctx.env.create_threadsafe_function(
+      &read_unsafe,
+      0 /* max_queue_size */,
+      |ctx: napi::threadsafe_function::ThreadSafeCallContext<(String, Box<Fn(CallContext) -> ()>)>| {
+        eprintln!("Context callback with value: {}", ctx.value.0);
+        let cb = ctx.env.create_function_from_closure("callback", *ctx.value.1);
+        Ok(vec![ ctx.env.create_string(ctx.value.0.as_ref()), cb ])
+      },
+    ).unwrap()
+  });
+
   let config: BundleConfig = ctx.env.from_js_value(opts)?;
-  let fs = FileProvider::new();
+  let fs = WrappedSourceProvider::new(FileProvider::new(), resolve, read);
   let res = compile_bundle(&fs, &config);
 
   match res {
@@ -197,7 +272,7 @@ struct CssModulesConfig {
   pattern: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BundleConfig {
   pub filename: String,
@@ -209,6 +284,7 @@ struct BundleConfig {
   pub analyze_dependencies: Option<bool>,
   pub pseudo_classes: Option<OwnedPseudoClasses>,
   pub unused_symbols: Option<HashSet<String>>,
+  pub resolve: Option<Box<dyn Fn(String) -> String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,7 +376,7 @@ fn compile<'i>(code: &'i str, config: &Config) -> Result<TransformResult, Compil
   })
 }
 
-fn compile_bundle<'i>(fs: &'i FileProvider, config: &BundleConfig) -> Result<TransformResult, CompileError<'i>> {
+fn compile_bundle<'i, P: SourceProvider>(fs: &'i P, config: &BundleConfig) -> Result<TransformResult, CompileError<'i>> {
   let mut source_map = if config.source_map.unwrap_or(false) {
     Some(SourceMap::new("/"))
   } else {
